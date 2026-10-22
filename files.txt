@@ -1,0 +1,18 @@
+1. pwd
+
+2. 
+iverilog -g2012 -I rtl -s tb_d2d_secure_top \
+-o simulation/tb_d2d_secure_top \
+rtl/d2d_defs.v \
+rtl/coherence_ledger.v \
+rtl/upgrade_manager.v \
+rtl/upgrade_ack_tracker.v \
+rtl/d2d_runtime_controller.v \
+rtl/d2d_secure_top.v \
+testbench/tb_d2d_secure_top.v
+
+3.
+vvp simulation/tb_d2d_secure_top
+
+4.
+cat simulation/verification_summary.txt

@@ -1,0 +1,213 @@
+
+`include "d2d_defs.v"
+
+module upgrade_ledger_integration (
+    input wire clk,
+    input wire reset,
+
+    input wire start_upgrade,
+    input wire [1:0] source,
+    input wire [15:0] address,
+
+    input wire ack_valid,
+    input wire [1:0] ack_source,
+
+    input wire init_write,
+    input wire [15:0] init_address,
+    input wire [1:0] init_state,
+    input wire [1:0] init_owner,
+    input wire [2:0] init_sharers,
+
+    output reg transaction_done,
+    output reg violation_valid,
+    output reg [1:0] violation_code,
+
+    output wire [2:0] received_acks,
+    output wire ledger_found_debug,
+    output wire [1:0] ledger_state_debug,
+    output wire [1:0] ledger_owner_debug,
+    output wire [2:0] ledger_sharers_debug
+);
+
+    // 16-entry trusted coherence ledger
+    reg valid [0:15];
+    reg [15:0] line_addr [0:15];
+    reg [1:0] line_state [0:15];
+    reg [1:0] owner [0:15];
+    reg [2:0] sharers [0:15];
+
+    // Upgrade transaction registers
+    reg active;
+    reg [1:0] requester;
+    reg [15:0] saved_address;
+    reg [2:0] saved_sharers;
+    reg [2:0] required_acks;
+    reg [2:0] ack_mask;
+
+    integer i;
+    integer match_index;
+    integer free_index;
+
+    // Combinational lookup results
+    reg found;
+    reg [1:0] current_state;
+    reg [1:0] current_owner;
+    reg [2:0] current_sharers;
+
+    always @(*) begin
+        found = 1'b0;
+        current_state = `INVALID;
+        current_owner = 2'b00;
+        current_sharers = 3'b000;
+
+        for (integer k = 0; k < 16; k = k + 1) begin
+            if (valid[k] && line_addr[k] == address) begin
+                found = 1'b1;
+                current_state = line_state[k];
+                current_owner = owner[k];
+                current_sharers = sharers[k];
+            end
+        end
+    end
+
+    assign ledger_found_debug = found;
+    assign ledger_state_debug = current_state;
+    assign ledger_owner_debug = current_owner;
+    assign ledger_sharers_debug = current_sharers;
+    assign received_acks = ack_mask;
+
+    // Ledger initialization and upgrade transaction logic
+    always @(posedge clk) begin
+        if (reset) begin
+            active <= 1'b0;
+            requester <= 2'b00;
+            saved_address <= 16'b0;
+            saved_sharers <= 3'b000;
+            required_acks <= 3'b000;
+            ack_mask <= 3'b000;
+
+            transaction_done <= 1'b0;
+            violation_valid <= 1'b0;
+            violation_code <= 2'b00;
+
+            for (i = 0; i < 16; i = i + 1) begin
+                valid[i] <= 1'b0;
+                line_addr[i] <= 16'b0;
+                line_state[i] <= `INVALID;
+                owner[i] <= 2'b00;
+                sharers[i] <= 3'b000;
+            end
+        end else begin
+            transaction_done <= 1'b0;
+            violation_valid <= 1'b0;
+
+            // Trusted initialization is allowed when idle.
+            if (init_write && !active && !start_upgrade) begin
+                match_index = -1;
+                free_index = -1;
+
+                for (i = 0; i < 16; i = i + 1) begin
+                    if (valid[i] && line_addr[i] == init_address)
+                        match_index = i;
+
+                    if (!valid[i] && free_index == -1)
+                        free_index = i;
+                end
+
+                if (match_index != -1) begin
+                    line_state[match_index] <= init_state;
+                    owner[match_index] <= init_owner;
+                    sharers[match_index] <= init_sharers;
+                end else if (free_index != -1) begin
+                    valid[free_index] <= 1'b1;
+                    line_addr[free_index] <= init_address;
+                    line_state[free_index] <= init_state;
+                    owner[free_index] <= init_owner;
+                    sharers[free_index] <= init_sharers;
+                end
+            end
+
+            // Validate and begin an upgrade request.
+            if (start_upgrade && !active) begin
+                if (!found) begin
+                    violation_valid <= 1'b1;
+                    violation_code <= 2'b11; // Unknown line
+                end else if (
+                    current_state != `SHARED ||
+                    source >= 3 ||
+                    !current_sharers[source]
+                ) begin
+                    violation_valid <= 1'b1;
+                    violation_code <= 2'b10; // Illegal upgrade
+                end else begin
+                    requester <= source;
+                    saved_address <= address;
+                    saved_sharers <= current_sharers;
+
+                    required_acks <=
+                        current_sharers & ~(3'b001 << source);
+
+                    ack_mask <= 3'b000;
+                    active <= 1'b1;
+                end
+            end else if (active) begin
+                // Accept ACKs only from chiplets that must respond.
+                if (
+                    ack_valid &&
+                    ack_source < 3 &&
+                    required_acks[ack_source]
+                ) begin
+                    ack_mask[ack_source] <= 1'b1;
+                end
+
+                // Include the current ACK when checking completion.
+                if (
+                    (
+                        (
+                            ack_mask |
+                            (
+                                (
+                                    ack_valid &&
+                                    ack_source < 3 &&
+                                    required_acks[ack_source]
+                                )
+                                ? (3'b001 << ack_source)
+                                : 3'b000
+                            )
+                        ) & required_acks
+                    ) == required_acks
+                ) begin
+                    match_index = -1;
+
+                    for (i = 0; i < 16; i = i + 1) begin
+                        if (
+                            valid[i] &&
+                            line_addr[i] == saved_address
+                        ) begin
+                            match_index = i;
+                        end
+                    end
+
+                    // Commit only if the line is unchanged.
+                    if (
+                        match_index != -1 &&
+                        line_state[match_index] == `SHARED &&
+                        sharers[match_index] == saved_sharers
+                    ) begin
+                        line_state[match_index] <= `MODIFIED;
+                        owner[match_index] <= requester;
+                        sharers[match_index] <= 3'b000;
+
+                        transaction_done <= 1'b1;
+                    end else begin
+                        violation_valid <= 1'b1;
+                        violation_code <= 2'b10;
+                    end
+
+                    active <= 1'b0;
+                end
+            end
+        end
+    end
+
+endmodule

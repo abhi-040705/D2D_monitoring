@@ -1,0 +1,288 @@
+
+`timescale 1ns/1ps
+
+module tb_d2d_secure_top;
+
+    reg clk = 0;
+    reg reset = 1;
+
+    reg init_write = 0;
+    reg [15:0] init_address = 0;
+    reg [1:0] init_state = 0;
+    reg [1:0] init_owner = 0;
+    reg [2:0] init_sharers = 0;
+
+    reg start_upgrade = 0;
+    reg [1:0] source = 0;
+    reg [15:0] address = 0;
+
+    reg ack_valid = 0;
+    reg [1:0] ack_source = 0;
+
+    wire transaction_done;
+    wire busy;
+    wire violation_valid;
+    wire [1:0] violation_code;
+
+    wire ledger_found_debug;
+    wire [1:0] ledger_state_debug;
+    wire [1:0] ledger_owner_debug;
+    wire [2:0] ledger_sharers_debug;
+    wire [2:0] received_acks;
+
+    integer passed = 0;
+
+    reg completion_seen = 0;
+    reg violation_seen = 0;
+
+    d2d_secure_top dut (
+        .clk(clk),
+        .reset(reset),
+        .init_write(init_write),
+        .init_address(init_address),
+        .init_state(init_state),
+        .init_owner(init_owner),
+        .init_sharers(init_sharers),
+        .start_upgrade(start_upgrade),
+        .source(source),
+        .address(address),
+        .ack_valid(ack_valid),
+        .ack_source(ack_source),
+        .transaction_done(transaction_done),
+        .busy(busy),
+        .violation_valid(violation_valid),
+        .violation_code(violation_code),
+        .ledger_found_debug(ledger_found_debug),
+        .ledger_state_debug(ledger_state_debug),
+        .ledger_owner_debug(ledger_owner_debug),
+        .ledger_sharers_debug(ledger_sharers_debug),
+        .received_acks(received_acks)
+    );
+
+    always #5 clk = ~clk;
+
+    // Capture one-cycle output pulses for reliable checking.
+    always @(posedge clk) begin
+        #1;
+        if (transaction_done)
+            completion_seen = 1'b1;
+
+        if (violation_valid)
+            violation_seen = 1'b1;
+    end
+
+    task tick;
+        begin
+            @(posedge clk);
+            #2;
+        end
+    endtask
+
+    task initialize_line;
+        input [15:0] addr;
+        input [1:0] owner;
+        input [2:0] sharers;
+        begin
+            @(negedge clk);
+            init_write = 1'b1;
+            init_address = addr;
+            init_state = 2'b01;
+            init_owner = owner;
+            init_sharers = sharers;
+
+            tick();
+
+            @(negedge clk);
+            init_write = 1'b0;
+            #1;
+        end
+    endtask
+
+    initial begin
+        // Generate a waveform for the complete top-level design.
+        $dumpfile("simulation/d2d_secure_top.vcd");
+        $dumpvars(0, tb_d2d_secure_top);
+
+        $display("----------------------------------------");
+        $display("Starting D2D secure top-level tests");
+        $display("----------------------------------------");
+
+        // Reset.
+        repeat (2) tick();
+        @(negedge clk);
+        reset = 0;
+        tick();
+
+        // TEST 1: Initialize a Shared cache line.
+        initialize_line(16'h1234, 2'd0, 3'b111);
+
+        address = 16'h1234;
+        #2;
+
+        if (ledger_found_debug &&
+            ledger_state_debug == 2'b01 &&
+            ledger_owner_debug == 2'd0 &&
+            ledger_sharers_debug == 3'b111) begin
+            $display("PASS: Shared cache line initialized");
+            passed = passed + 1;
+        end else begin
+            $display("FAIL: Shared cache line initialization");
+        end
+
+        // TEST 2: Start an upgrade from chiplet 0.
+        completion_seen = 0;
+
+        @(negedge clk);
+        source = 2'd0;
+        address = 16'h1234;
+        start_upgrade = 1'b1;
+
+        tick();
+
+        @(negedge clk);
+        start_upgrade = 1'b0;
+
+        repeat (3) tick();
+
+        if (busy) begin
+            $display("PASS: Valid upgrade waits for ACKs");
+            passed = passed + 1;
+        end else begin
+            $display("FAIL: Valid upgrade did not wait for ACKs");
+        end
+
+        // TEST 3: Ledger must remain Shared while waiting.
+        if (ledger_found_debug &&
+            ledger_state_debug == 2'b01) begin
+            $display("PASS: Ledger unchanged while waiting for ACK");
+            passed = passed + 1;
+        end else begin
+            $display("FAIL: Ledger changed before ACK completion");
+        end
+
+        // TEST 4: Chiplets 1 and 2 acknowledge invalidation.
+        @(negedge clk);
+        ack_valid = 1'b1;
+        ack_source = 2'd1;
+
+        tick();
+
+        @(negedge clk);
+        ack_source = 2'd2;
+
+        tick();
+
+        @(negedge clk);
+        ack_valid = 1'b0;
+
+        repeat (5) tick();
+
+        if (completion_seen &&
+            ledger_found_debug &&
+            ledger_state_debug == 2'b10 &&
+            ledger_owner_debug == 2'd0 &&
+            ledger_sharers_debug == 3'b000) begin
+            $display("PASS: Upgrade commits after required ACKs");
+            passed = passed + 1;
+        end else begin
+            $display(
+                "FAIL: Upgrade commit (done_seen=%b state=%b owner=%d sharers=%b busy=%b)",
+                completion_seen,
+                ledger_state_debug,
+                ledger_owner_debug,
+                ledger_sharers_debug,
+                busy
+            );
+        end
+
+        // TEST 5: Unknown address must be rejected.
+        violation_seen = 0;
+
+        @(negedge clk);
+        address = 16'h9999;
+        source = 2'd0;
+        start_upgrade = 1'b1;
+
+        tick();
+
+        @(negedge clk);
+        start_upgrade = 1'b0;
+
+        repeat (2) tick();
+
+        if (violation_seen) begin
+            $display("PASS: Unknown cache line rejected");
+            passed = passed + 1;
+        end else begin
+            $display(
+                "FAIL: Unknown cache line rejection (code=%b)",
+                violation_code
+            );
+        end
+
+        // TEST 6: A non-sharer must be rejected.
+        initialize_line(16'h5678, 2'd0, 3'b011);
+
+        address = 16'h5678;
+        source = 2'd2;
+        violation_seen = 0;
+
+        @(negedge clk);
+        start_upgrade = 1'b1;
+
+        tick();
+
+        @(negedge clk);
+        start_upgrade = 1'b0;
+
+        repeat (2) tick();
+
+        if (violation_seen) begin
+            $display("PASS: Non-sharer upgrade rejected");
+            passed = passed + 1;
+        end else begin
+            $display(
+                "FAIL: Non-sharer upgrade rejection (code=%b)",
+                violation_code
+            );
+        end
+
+        // TEST 7: Rejected request must leave the ledger unchanged.
+        address = 16'h5678;
+        #2;
+
+        if (ledger_found_debug &&
+            ledger_state_debug == 2'b01 &&
+            ledger_owner_debug == 2'd0 &&
+            ledger_sharers_debug == 3'b011) begin
+            $display("PASS: Rejected upgrade leaves ledger unchanged");
+            passed = passed + 1;
+        end else begin
+            $display(
+                "FAIL: Rejected upgrade changed ledger (found=%b state=%b owner=%d sharers=%b)",
+                ledger_found_debug,
+                ledger_state_debug,
+                ledger_owner_debug,
+                ledger_sharers_debug
+            );
+        end
+
+        $display("----------------------------------------");
+        $display("Tests passed: %0d / 7", passed);
+
+        if (passed == 7)
+            $display("ALL TOP-LEVEL TESTS PASSED");
+        else
+            $display("SOME TOP-LEVEL TESTS FAILED");
+
+        $finish;
+    end
+
+    // Prevent a hung simulation.
+    initial begin
+        #10000;
+        $display("ERROR: Simulation timeout");
+        $finish;
+    end
+
+endmodule
